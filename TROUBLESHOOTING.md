@@ -39,5 +39,3 @@ Three real infrastructure issues were diagnosed and resolved while deploying Jum
 📸 Related: `screenshots/01-scenario1-pam-enforcement/04-connectivity-verification/04-connectivity-test-passing.png`
 
 ---
-
-*If you have the full original write-ups for these three incidents (commands run, exact error output, timestamps), paste them here to replace these summaries with the complete incident-report-style detail.*
