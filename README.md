@@ -1,157 +1,172 @@
-# PAM-lab — Privileged Access Management with JumpServer
+# PAM Enforcement & Threat Detection
 
-A hands-on lab demonstrating Privileged Access Management (PAM) concepts using [JumpServer](https://github.com/jumpserver/jumpserver), an open-source PAM platform, deployed in a fully isolated virtual network. Built as part of my transition into Cloud / Network / Ops / Security roles.
+**Author:** Amr Ahmed Mohamed Abdeldayem
+**Program:** CyberOps Associate Internship — Cisco NetAcad
 
-## Why this matters
+
+---
+
+## Overview
+
+This repository documents a two-part SOC analyst lab built across a single monitored network segment:
+
+| # | Scenario | What it proves |
+|---|----------|-----------------|
+| 1 | **PAM Enforcement Validation** | A [JumpServer](https://github.com/jumpserver/jumpserver) PAM bastion — deployed as an 8-container stack from scratch — actively blocks a defined set of dangerous commands in real time, with every stage from network isolation through live enforcement documented. Network monitoring is then used to characterize what it can and cannot see about that session. |
+| 2 | **Offensive Simulation & Detection** | A real, minimal kill chain (recon → exploitation) against a deliberately vulnerable host is correctly detected, and the resulting alerts are triaged from raw payload, not signature name. |
+
+Every packet on the segment — from both scenarios — was captured passively by **Security Onion** (Zeek + Snort) and triaged with **Squert** / **Kibana**. Every action inside the PAM bastion itself — deployment, onboarding, authorization, live enforcement — was captured at the application layer by **JumpServer's own audit system**. Together, the two evidence sets demonstrate the full picture a SOC analyst actually works with: host/application-layer audit trails *and* network-layer detection, and where each one alone falls short.
+
+Full write-up with evidence: **[INCIDENT-REPORT.md](INCIDENT-REPORT.md)**
+Infrastructure debugging log for the PAM deployment: **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)**
+
+---
+
+## Why This Matters
 
 Enterprises don't let engineers SSH directly into production servers with shared credentials — that fails every compliance audit (SOC 2, PCI-DSS, ISO 27001) that requires access control, least-privilege enforcement, and session auditability. PAM platforms like JumpServer, CyberArk, and BeyondTrust solve this by sitting between the user and the target system: broker the connection, enforce who can reach what, log every keystroke, and block dangerous commands before they execute.
 
-This lab builds that stack from scratch — network isolation, PAM deployment, access policy configuration, and live enforcement testing — to demonstrate practical understanding of *why* these controls exist, not just how to click through a UI.
+This lab builds that stack from scratch — network isolation, PAM deployment, access policy configuration, and live enforcement testing — then adds a second, adversarial scenario and a network detection layer on top, to demonstrate practical understanding of *why* these controls exist and how a SOC analyst validates and triages them, not just how to click through a UI.
 
-## Architecture
+---
+
+## Lab Architecture
 
 ```
-                    ┌─────────────────────────┐
-                    │   pam-lab (isolated     │
-                    │   VMware LAN segment)   │
-                    │   10.0.0.0/24           │
-                    └─────────────────────────┘
-                              │
-        ┌─────────────────────┼─────────────────────┐
-        │                     │                     │
-┌───────────────┐   ┌──────────────────┐   ┌──────────────────┐
-│ RH-LinuxAdmin │   │ Cybersecurity_Lab│   │  (planned)       │
-│ 10.0.0.17     │   │ VM ("secOps")    │   │  Windows target  │
-│               │   │ 10.0.0.18        │   │  RDP + LOLBAS    │
-│ JumpServer    │   │ SSH target       │   └──────────────────┘
-│ (8 containers)│   │ (analyst account)│
-└───────────────┘   └──────────────────┘
-        │
-   NAT adapter (2nd NIC)
-   for image pulls only
+                         PAM-LAB SEGMENT — 10.0.0.0/24 (isolated VMware LAN)
+   ┌───────────────┐  ┌───────────────┐  ┌───────────────┐  ┌─────────────── ┐
+   │ RH-LinuxAdmin │  │ secOps        │  │ Kali Linux    │  │ Metasploitable2│
+   │ 10.0.0.17     │  │ 10.0.0.18     │  │ 10.0.0.20     │  │ 10.0.0.25      │
+   │ JumpServer    │  │ Managed PAM   │  │ Attacker      │  │ Victim host    │
+   │ (8 containers)│  │ client (SSH)  │  │               │  │                │
+   └───────┬───────┘  └───────┬───────┘  └───────┬───────┘  └───────┬────────┘
+           └──────────────────┴──────────────────┴──────────────────┘
+                                      │
+                            (passive tap — eth0)
+                                      │
+                          ┌───────────────────────┐
+                          │     Security Onion    │
+                          │  Zeek · Snort · Squert│
+                          │    · Kibana · Sguil   │
+                          └───────────────────────┘
 ```
 
-- **RH-LinuxAdmin** — hosts the full JumpServer stack (core, celery, koko, lion, chen, web, postgresql, redis) via Docker Compose, dual-homed: one NIC on the isolated lab segment, one NAT NIC used only for pulling container images.
-- **Cybersecurity_Lab_VM ("secOps")** — the managed target. SSH-only, no direct access — all connections proxied through JumpServer's `koko` component.
-- Network is fully air-gapped from the host machine and internet except where explicitly needed (image pulls), mirroring how a real segmented environment isolates privileged access paths.
+- **RH-LinuxAdmin (10.0.0.17)** — hosts the full JumpServer stack (`core`, `celery`, `koko`, `lion`, `chen`, `web`, `postgresql`, `redis`) via Docker Compose, dual-homed: one NIC on the isolated lab segment, one NAT NIC used only for pulling container images.
+- **secOps / Cybersecurity_Lab_VM (10.0.0.18)** — the managed PAM target. SSH-only, no direct access — all connections proxied through JumpServer's `koko` component.
+- **Kali Linux (10.0.0.20)** / **Metasploitable2 (10.0.0.25)** — the offensive-simulation pair for Scenario 2.
+- The network is fully air-gapped from the host machine and internet except where explicitly needed (image pulls), mirroring how a real segmented environment isolates privileged access paths.
+- Security Onion's `eth0` passively taps the shared segment, so traffic from **both** scenarios lands in the same evidence set.
 
-## What's been built
+📸 [`screenshots/00-environment/00-vm-inventory.png`](screenshots/00-environment/00-vm-inventory.png) - VMware Workstation library confirming the VM inventory.
 
-### 1. Network foundation
-- Isolated VMware LAN segment (`pam-lab`, `10.0.0.0/24`) connecting the JumpServer host and target
-- Static IP configuration via `nmcli` (NetworkManager-managed interfaces)
-- Dual-NIC setup on the JumpServer host: isolated segment + NAT for image pulls only
+---
 
-### 2. JumpServer deployment
-- Full 8-container stack deployed via the official quick-start installer (Docker Compose)
-- All services verified healthy: `core`, `celery`, `koko`, `lion`, `chen`, `web`, `postgresql`, `redis`
+## Repository Structure
 
-### 3. Asset onboarding & access control
-- Target asset (`analyst@10.0.0.18`) registered with SSH protocol
-- Account credential stored and connectivity verified (green "OK" status)
-- **Authorization** created binding: Administrator user → `analyst` asset → `analyst` account → Connect action
-- Connectivity confirmed end-to-end through JumpServer's web-based Luna terminal (`koko` proxy)
+```
+SOC-analysis-lab/
+├── README.md                   
+├── INCIDENT-REPORT.md            
+├── TROUBLESHOOTING.md            
+├── LICENSE                     
+├── .gitignore
+└── screenshots/
+    ├── 00-environment/
+    │   └── 00-vm-inventory.png                                      
+    │
+    ├── 01-scenario1-pam-enforcement/
+    │   ├── 01-network-foundation/
+    │   │   ├── 01a-vmware-lan-segment-rhadmin.png                         
+    │   │   ├── 01b-vmware-lan-segment-cyberlab.png                    
+    │   │   ├── 01c-secops-manual-ip-config.png                         
+    │   │   ├── 01d-secops-ping-success.png                              
+    │   │   └── 01e-rhadmin-ping-success.png                            
+    │   ├── 02-jumpserver-deployment/
+    │   │   └── 02-jumpserver-containers-healthy.png                      
+    │   ├── 03-asset-account-authorization/
+    │   │   ├── 03a-jumpserver-signin-page.png                            
+    │   │   ├── 03b-first-login-console-pam-audits-workbench.png            
+    │   │   ├── 03c-console-dashboard.png                                   
+    │   │   ├── 03d-asset-protocol-config.png                         
+    │   │   ├── 03e-authorization-details-actions.png                  
+    │   │   ├── 03f-users-list.png                                       
+    │   │   ├── 03g-user-authorization-rules-tab.png                      
+    │   │   ├── 03h-asset-details-basic.png                                 
+    │   │   ├── 03i-asset-details-hardware.png                              
+    │   │   └── 03j-authorization-full-config.png                        
+    │   ├── 04-connectivity-verification/
+    │   │   └── 04-connectivity-test-passing.png                            
+    │   ├── 05-live-proxied-session/
+    │   │   ├── 05a-workbench-access-assets-list.png                       
+    │   │   ├── 05b-connect-dialog-analyst.png                            
+    │   │   └── 05c-session-terminal-whoami-hostname.png                    
+    │   ├── 06-session-recording-audit/
+    │   │   ├── 06a-session-playback-player.png                             
+    │   │   ├── 06b-session-playback-download.png                           
+    │   │   ├── 06c-session-commands-log.png                                
+    │   │   ├── 06d-pam-accounts-dashboard.png                             
+    │   │   ├── 06e-audits-dashboard-command-stats.png                      
+    │   │   └── 06f-audits-historical-sessions-with-actions.png             
+    │   ├── 07-command-filtering-setup/
+    │   │   ├── 07a-command-group-dangerous-commands.png                   
+    │   │   └── 07b-command-filter-acl-config.png                         
+    │   ├── 08-active-enforcement/
+    │   │   ├── 08a-commands-blocked-live.png                              
+    │   │   ├── 08b-blocked-commands-alt-view.png                           
+    │   │   └── 08c-asset-sessions-replayable-playback-columns.png          
+    │   └── 09-network-detection-evidence/
+    │       ├── 09a-capture-import-pam-lab-incident.png                     
+    │       ├── 09b-squert-false-positive-alert-list.png                   
+    │       └── 09c-squert-false-positive-raw-payload.png                 
+    │
+    └── 02-scenario2-offensive-simulation/
+        ├── 01-nmap-scan-vsftpd-identified.png                         
+        ├── 02-capture-import-metasploitable-incident.png                 
+        ├── 03-kibana-overview-dashboard.png                             
+        ├── 04-kibana-alert-summary-table.png                           
+        ├── 05-ftp-backdoor-trigger-terminal.png                          
+        ├── 06-root-shell-confirmed-nc-6200.png                           
+        └── 07-squert-true-positive-root-compromise.png                    
+```
 
-### 4. Session recording & audit
-- Live SSH session proxied through JumpServer, confirmed via `whoami` / `hostname` inside the session
-- Session recording captured and replayable (`Audits → Asset sessions → Historical sessions`)
-- Every command logged individually via `Audits → Session commands`
+> Folders `01` through `08` under Scenario 1 mirror the original PAM-lab build order exactly (network → deployment → onboarding → connectivity → live session → audit → filter policy → enforcement). Folder `09` holds the network-detection layer (Security Onion / Squert) added on top of that original lab for this SOC project.
 
-### 5. Command filtering (active enforcement)
-- Custom **Command Group** (`Dangerous Commands`) defined: `rm`, `rm -rf`, `sudo su`, `sudo -i`, `dd if=`, `mkfs`
-- **Command Filter ACL** created referencing that group, action set to **Reject**
-- Verified the filter actively blocks matched commands mid-session — not just logging them after the fact
+---
 
-### 6. Access revocation
-- Demonstrated that disabling an authorization immediately removes the asset from the user's accessible list in Workbench and blocks further connection attempts — proving enforcement, not just configuration
+## Toolchain
 
-## Screenshots
+`JumpServer v4.10.19-ce` · `Docker` · `VMware Workstation` · `RHEL 10` · `Ubuntu 22.04` · `NetworkManager` · `Ansible` (JumpServer's connectivity-test executor) · `Security Onion` · `Zeek` · `Snort` · `Squert` · `Kibana` · `Kali Linux` · `Metasploitable2`
 
-All screenshots live in [`/screenshots`](./screenshots), numbered to follow the build order below.
+---
 
-### 1. Network foundation
-| File | Description |
-|---|---|
-| `01a-vmware-lan-segment-rhadmin.png` | RH-LinuxAdmin network adapter set to the isolated `pam-lab` LAN segment |
-| `01b-vmware-lan-segment-cyberlab.png` | Cybersecurity_Lab_VM (secOps) network adapter set to the same `pam-lab` segment |
-| `01c-secops-manual-ip-config.png` | secOps — manual IP assignment before the NetworkManager fix (see Incident 1) |
-| `01d-secops-ping-success.png` | secOps → RH-LinuxAdmin ping succeeding after the fix |
-| `01e-rhadmin-ping-success.png` | RH-LinuxAdmin → secOps ping succeeding, confirming bidirectional connectivity |
+## Key Findings (summary)
 
-### 2. JumpServer deployment
-| File | Description |
-|---|---|
-| `02-jumpserver-containers-healthy.png` | Full 17/17 image pulls and 8/8 containers started |
+| Evidence | Verdict | Why |
+|----------|---------|-----|
+| 6/6 filtered commands (`rm`, `rm -rf`, `sudo su`, `sudo -i`, `dd if=`, `mkfs`) | 🟢 **Enforced** | JumpServer's Command Filter ACL rejected all six live, each with `Command 'X' is forbidden`. |
+| `GPL WEB_SERVER DELETE attempt` (10.0.0.18 → 10.0.0.17) | 🟡 **False Positive** | Generic Snort signature matched a legitimate JumpServer REST API call — valid session cookie + CSRF token present in payload. |
+| `GPL ATTACK_RESPONSE id check returned root` (10.0.0.25 → 10.0.0.20) | 🔴 **True Positive** | Literal command output `uid=0(root) gid=0(root).` captured in response traffic from the vsftpd 2.3.4 backdoor (port 6200) — confirmed root-level compromise. |
 
-### 3. Asset, account & authorization setup
-| File | Description |
-|---|---|
-| `03a-jumpserver-signin-page.png` | JumpServer sign-in page, accessed from the secOps desktop |
-| `03b-first-login-console-pam-audits-workbench.png` | First-login onboarding and the Console / PAM / Audits / Workbench module switcher |
-| `03c-console-dashboard.png` | Console module dashboard and sidebar navigation |
-| `03d-asset-protocol-config.png` | Asset edit panel — SFTP/SSH protocol configuration |
-| `03e-authorization-details-actions.png` | Authorization detail — granted actions (Connect, Upload, Download, etc.) |
-| `03f-users-list.png` | Users list — single Administrator account |
-| `03g-user-authorization-rules-tab.png` | Administrator's Authorization rules tab, linked to `secOps-target` |
-| `03h-asset-details-basic.png` | Asset details — basic information panel |
-| `03i-asset-details-hardware.png` | Asset details — auto-discovered hardware info (CPU, OS, MAC) |
-| `03j-authorization-full-config.png` | **Key fix** — full authorization config with User + Asset + Account all correctly bound (see Incident 4) |
+Full evidence, payloads, and reasoning: **[INCIDENT-REPORT.md](INCIDENT-REPORT.md)**
 
-### 4. Connectivity verification
-| File | Description |
-|---|---|
-| `04-connectivity-test-passing.png` | Connectivity test output: "Connection and authentication successful" (after fixing the missing Ansible executor image — Incident 3) |
+---
 
-### 5. Live proxied session
-| File | Description |
-|---|---|
-| `05a-workbench-access-assets-list.png` | Workbench showing the `analyst` asset available after the authorization fix |
-| `05b-connect-dialog-analyst.png` | Connect dialog — account and connect-method selection |
-| `05c-session-terminal-whoami-hostname.png` | Live proxied SSH session — `whoami`/`hostname` confirming a real connection to secOps |
-
-### 6. Session recording & audit
-| File | Description |
-|---|---|
-| `06a-session-playback-player.png` | Session replay player — command sidebar, scrubber, live terminal replay |
-| `06b-session-playback-download.png` | Recording export as a downloadable `.tar` file |
-| `06c-session-commands-log.png` | Per-command audit log for a session (7 commands, all "Accept" — pre-filter baseline) |
-| `06d-pam-accounts-dashboard.png` | PAM module accounts overview |
-| `06e-audits-dashboard-command-stats.png` | Audits dashboard — login logs, command stats, session trends |
-| `06f-audits-historical-sessions-with-actions.png` | Audits → Historical sessions with play/download action icons |
-
-### 7. Command filtering setup
-| File | Description |
-|---|---|
-| `07a-command-group-dangerous-commands.png` | Command Group definition — `rm`, `rm -rf`, `sudo su`, `sudo -i`, `dd if=`, `mkfs` |
-| `07b-command-filter-acl-config.png` | Command Filter ACL — group bound, Action: **Reject** |
-
-### 8. Active enforcement
-| File | Description |
-|---|---|
-| `08a-commands-blocked-live.png` | **Highlight** — all six dangerous commands rejected live, each with a `Command 'X' is forbidden` message |
-| `08b-blocked-commands-alt-view.png` | Second view of the same enforcement test |
-| `08c-asset-sessions-replayable-playback-columns.png` | Asset sessions table showing Replayable and Playback status columns |
-
-## Known issues encountered & fixed
-
-Three real infrastructure bugs were diagnosed and resolved during this build — see [`TROUBLESHOOTING.md`](./TROUBLESHOOTING.md) for full incident-style writeups:
-
-1. **NetworkManager silently reverting manual IP assignments** — imperative `ip addr add` commands were overwritten by NetworkManager's own reconciliation loop; fixed by configuring via `nmcli` instead.
-2. **Missing Python dependency (`requests_unixsocket`) in the official `jumpserver/core` image** — caused a crash loop on both `core` and `celery` containers (same image, separate writable layers, required patching each independently).
-3. **Missing `jumpserver/ansible-executor` image** — JumpServer's connectivity test spins up a separate Ansible-based container to perform the actual SSH probe; this image was never pulled during install and had to be fetched manually.
-
-## Roadmap / not yet implemented
+## Roadmap / Not Yet Implemented
 
 - [ ] Tiered access: second low-privilege account with a separate, narrower authorization
 - [ ] Time-boxed / expiring access grants (just-in-time access pattern)
 - [ ] MFA enabled on the admin account
 - [ ] Windows target VM — RDP proxying via `lion`, LOLBAS detection pairing
-- [ ] Security Onion integration — network-level visibility into JumpServer-proxied sessions
+- [x] Security Onion integration — network-level visibility into JumpServer-proxied sessions *(this repo)*
 
-## Tech stack
+---
 
-`JumpServer v4.10.19-ce` · `Docker` · `VMware Workstation` · `RHEL 10` · `Ubuntu 22.04` · `NetworkManager` · `Ansible` (via JumpServer's executor)
+## Author's Note
 
-## Author's note
+Built as a self-directed project while completing a CyberOps Associate internship and studying for Cloud/Network/Ops/Security roles. The goal wasn't just to get JumpServer running or to pop a known-vulnerable box, it was to understand *why* each control exists (network isolation, credential vaulting, session recording, command filtering) and to practice the kind of methodical, layer-by-layer work, both building controls and triaging alerts against them, that real SOC and infrastructure work actually requires.
 
-Built as a self-directed lab while studying for Cloud/Network/Ops/Security roles. The goal wasn't just to get JumpServer running, but to understand *why* each piece exists — the network isolation, the credential vaulting, the session recording, the command filtering — and to practice the kind of methodical, layer-by-layer debugging (network → routing → application → dependency) that real infrastructure work actually requires.
+---
+
+## Ethical Use Notice
+
+This lab was performed entirely inside an isolated, non-production VM segment (`10.0.0.0/24`) against intentionally vulnerable software (Metasploitable2) for educational purposes. No systems outside this lab were accessed or tested.
